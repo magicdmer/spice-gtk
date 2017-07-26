@@ -94,6 +94,7 @@ struct _SpiceFileTransferTaskPrivate
     GAsyncReadyCallback            callback;
     gpointer                       user_data;
     char                           *buffer;
+    char 						   *filename;
     uint64_t                       read_bytes;
     uint64_t                       file_size;
     gint64                         start_time;
@@ -2964,6 +2965,53 @@ signal:
     g_signal_emit(self, task_signals[SIGNAL_FINISHED], 0, error);
 }
 
+static void file_xfer_directory_info_async_cb(GObject *obj, GAsyncResult *res, gpointer data)
+{
+    GFileInfo *info;
+    GFile *file = G_FILE(obj);
+    GError *error = NULL;
+    GKeyFile *keyfile = NULL;
+    VDAgentFileXferStartMessage msg;
+    gsize /*msg_size*/ data_len;
+    gchar *string;
+    SpiceFileTransferTask *self = SPICE_FILE_TRANSFER_TASK(data);
+
+    self->priv->pending = FALSE;
+    info = g_file_query_info_finish(file, res, &error);
+    if (error || self->priv->error)
+        goto failed;
+
+    self->priv->file_size =
+        g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_STANDARD_SIZE);
+    g_object_notify(G_OBJECT(self), "progress");
+    keyfile = g_key_file_new();
+
+    /* File name */
+    g_key_file_set_string(keyfile, "vdagent-file-xfer", "name", self->priv->filename);
+    /* File size */
+    g_key_file_set_integer(keyfile, "vdagent-file-xfer", "type", 0);
+
+    g_key_file_set_uint64(keyfile, "vdagent-file-xfer", "size", self->priv->file_size);
+
+    /* Save keyfile content to memory. TODO: more file attributions
+       need to be sent to guest */
+    string = g_key_file_to_data(keyfile, &data_len, &error);
+    g_key_file_free(keyfile);
+    if (error)
+        goto failed;
+
+    /* Create file-xfer start message */
+    msg.id = self->priv->id;
+    agent_msg_queue_many(self->priv->channel, VD_AGENT_FILE_XFER_START,
+                         &msg, sizeof(msg),
+                         string, data_len + 1, NULL);
+    g_free(string);
+    spice_channel_wakeup(SPICE_CHANNEL(self->priv->channel), FALSE);
+    return;
+
+failed:
+    spice_file_transfer_task_completed(self, error);
+}
 
 static void file_xfer_info_async_cb(GObject *obj, GAsyncResult *res, gpointer data)
 {
@@ -2991,6 +3039,8 @@ static void file_xfer_info_async_cb(GObject *obj, GAsyncResult *res, gpointer da
     basename = g_file_get_basename(file);
     g_key_file_set_string(keyfile, "vdagent-file-xfer", "name", basename);
     g_free(basename);
+    
+    g_key_file_set_integer(keyfile, "vdagent-file-xfer", "type", 0);
     /* File size */
     g_key_file_set_uint64(keyfile, "vdagent-file-xfer", "size", self->priv->file_size);
 
@@ -3012,6 +3062,29 @@ static void file_xfer_info_async_cb(GObject *obj, GAsyncResult *res, gpointer da
 
 failed:
     spice_file_transfer_task_completed(self, error);
+}
+
+static void file_xfer_directory_read_async_cb(GObject *obj, GAsyncResult *res, gpointer data)
+{
+    GFile *file = G_FILE(obj);
+    SpiceFileTransferTask *self = SPICE_FILE_TRANSFER_TASK(data);
+    GError *error = NULL;
+
+    self->priv->pending = FALSE;
+    self->priv->file_stream = g_file_read_finish(file, res, &error);
+    if (error || self->priv->error) {
+        spice_file_transfer_task_completed(self, error);
+        return;
+    }
+
+    g_file_query_info_async(self->priv->file,
+                            G_FILE_ATTRIBUTE_STANDARD_SIZE,
+                            G_FILE_QUERY_INFO_NONE,
+                            G_PRIORITY_DEFAULT,
+                            self->priv->cancellable,
+                            file_xfer_directory_info_async_cb,
+                            self);
+    self->priv->pending = TRUE;
 }
 
 static void file_xfer_read_async_cb(GObject *obj, GAsyncResult *res, gpointer data)
@@ -3049,6 +3122,114 @@ static void task_finished(SpiceFileTransferTask *task,
     g_hash_table_remove(channel->priv->file_xfer_tasks, GUINT_TO_POINTER(task->priv->id));
 }
 
+static bool is_directory(GFile* file)
+{
+    GError* error = NULL;
+    GFileInfo *info = g_file_query_info(file,
+					  G_FILE_ATTRIBUTE_STANDARD_TYPE,
+					  G_FILE_QUERY_INFO_NONE,
+					  NULL,&error);
+	if (info == NULL)
+	{
+		return false;
+	}
+
+    if (g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY)
+    {
+        g_object_unref(info);
+        return true;
+    }
+        
+    g_object_unref(info);
+    return false;
+}
+
+static void
+get_dir_files (GFile * parent,GArray* array_directorys,GArray* array_files)
+{
+	gboolean res;
+	GError *error;
+	GFileEnumerator *enumerator;
+	GFileInfo *info;
+	GFile *descend;
+	char* relative_path = NULL;
+		
+	error = NULL;
+	enumerator =
+	g_file_enumerate_children (parent, "*",
+				   G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL,
+				   &error);
+	g_assert (enumerator != NULL);
+	g_assert (error == NULL);
+
+	error = NULL;
+	info = g_file_enumerator_next_file (enumerator, NULL, &error);
+	while ((info) && (!error))
+	{
+		descend = g_file_get_child (parent, g_file_info_get_name (info));
+		g_assert (descend != NULL);
+
+
+		relative_path = g_file_get_path(descend);
+		if (relative_path == NULL)
+		{
+			break;
+		}
+		
+		if (g_file_info_get_file_type (info) == G_FILE_TYPE_DIRECTORY)
+		{
+			g_array_append_val(array_directorys,relative_path);
+			get_dir_files (descend,array_directorys,array_files);
+		}
+		else
+		{
+			g_array_append_val(array_files,relative_path);
+		}
+
+		g_object_unref (descend);
+		error = NULL;
+		info = g_file_enumerator_next_file (enumerator, NULL, &error);
+	}
+	g_assert (error == NULL);
+
+	error = NULL;
+	res = g_file_enumerator_close (enumerator, NULL, &error);
+	g_assert_cmpint (res, ==, TRUE);
+	g_assert (error == NULL);
+}
+
+static void file_xfer_send_directory(SpiceMainChannel *channel,SpiceFileTransferTask *task,char* directoryName)
+{
+    GKeyFile *keyfile = NULL;
+    gchar *string;
+    gsize /*msg_size*/ data_len;
+    GError* error = NULL;
+    VDAgentFileXferStartMessage msg;
+
+	task->priv->pending = TRUE;
+	
+    keyfile = g_key_file_new();
+    g_key_file_set_string(keyfile, "vdagent-file-xfer", "name", directoryName);
+    g_key_file_set_integer(keyfile, "vdagent-file-xfer", "type", 1);
+    g_key_file_set_uint64(keyfile, "vdagent-file-xfer", "size", 0);
+
+    string = g_key_file_to_data(keyfile, &data_len, &error);
+    g_key_file_free(keyfile);
+    if (error)
+        spice_file_transfer_task_completed(task, error);
+    else
+    {
+        msg.id = task->priv->id;
+        agent_msg_queue_many(channel, VD_AGENT_FILE_XFER_START,
+                    &msg, sizeof(msg),
+                    string, data_len + 1, NULL);
+        g_free(string);
+        spice_channel_wakeup(SPICE_CHANNEL(channel), FALSE);    
+    }
+    
+    task->priv->pending = FALSE;
+}
+
 static void file_xfer_send_start_msg_async(SpiceMainChannel *channel,
                                            GFile **files,
                                            GFileCopyFlags flags,
@@ -3061,6 +3242,7 @@ static void file_xfer_send_start_msg_async(SpiceMainChannel *channel,
     SpiceMainChannelPrivate *c = channel->priv;
     SpiceFileTransferTask *task;
     gint i;
+   
 
     for (i = 0; files[i] != NULL && !g_cancellable_is_cancelled(cancellable); i++) {
         GCancellable *task_cancellable = cancellable;
@@ -3085,16 +3267,132 @@ static void file_xfer_send_start_msg_async(SpiceMainChannel *channel,
         g_signal_connect(task, "finished", G_CALLBACK(task_finished), channel);
         g_signal_emit(channel, signals[SPICE_MAIN_NEW_FILE_TRANSFER], 0, task);
 
-        g_file_read_async(files[i],
+		if (!is_directory(files[i]))
+        {
+            g_file_read_async(files[i],
                           G_PRIORITY_DEFAULT,
                           cancellable,
                           file_xfer_read_async_cb,
                           g_object_ref(task));
-        task->priv->pending = TRUE;
+                          
+         	task->priv->pending = TRUE;
+         	
 
-        /* if we created a per-task cancellable above, free it */
-        if (!cancellable)
-            g_object_unref(task_cancellable);
+		    /* if we created a per-task cancellable above, free it */
+		    if (!cancellable)
+		        g_object_unref(task_cancellable);
+            
+        }
+        else
+        {    
+           	char *relative_path = NULL;
+            gchar *basename = NULL;
+            GFile *root = NULL;
+            GArray *array_directorys;
+            GArray *array_files;
+            GFile *file = NULL;
+            int j = 0;
+			
+            array_directorys = g_array_new(TRUE,TRUE,sizeof(char*));
+            array_files = g_array_new(TRUE,TRUE,sizeof(char*));
+            
+            get_dir_files(files[i],array_directorys,array_files);
+            
+            basename = g_file_get_basename(files[i]);
+            file_xfer_send_directory(channel,task,basename);
+            g_free(basename);
+            
+            root = g_file_get_parent(files[i]);
+            for (j = 0; j < array_directorys->len; j++)
+            {
+            	GCancellable *task_cancellable = cancellable;
+        
+				if (!task_cancellable)
+				    task_cancellable = g_cancellable_new();
+				
+				char *directory_path = g_array_index(array_directorys,char*,j);
+				file = g_file_new_for_path(directory_path);
+				g_free(directory_path);
+				
+				task = spice_file_transfer_task_new(channel, file, task_cancellable);
+				task->priv->flags = flags;
+				task->priv->progress_callback = progress_callback;
+				task->priv->progress_callback_data = progress_callback_data;
+				task->priv->callback = callback;
+				task->priv->user_data = user_data;
+
+				CHANNEL_DEBUG(channel, "Insert a xfer task:%d to task list",
+				              task->priv->id);
+				g_hash_table_insert(c->file_xfer_tasks,
+				                    GUINT_TO_POINTER(task->priv->id),
+				                    task);
+				                    
+				g_signal_connect(task, "finished", G_CALLBACK(task_finished), channel);
+				g_signal_emit(channel, signals[SPICE_MAIN_NEW_FILE_TRANSFER], 0, task);
+				
+                relative_path = g_file_get_relative_path(root,file);
+                file_xfer_send_directory(channel,task,relative_path);
+                
+                g_free(relative_path);
+                g_object_unref(file);
+
+				/* if we created a per-task cancellable above, free it */
+				if (!cancellable)
+				    g_object_unref(task_cancellable);
+            
+            }
+			
+            for (j = 0; j < array_files->len; j++)
+            {
+            	GCancellable *task_cancellable = cancellable;
+        
+				if (!task_cancellable)
+				    task_cancellable = g_cancellable_new();
+
+				char *file_path = g_array_index(array_files,char*,j);
+				file = g_file_new_for_path(file_path);
+				g_free(file_path);
+				
+				task = spice_file_transfer_task_new(channel, file, task_cancellable);
+				task->priv->flags = flags;
+				task->priv->progress_callback = progress_callback;
+				task->priv->progress_callback_data = progress_callback_data;
+				task->priv->callback = callback;
+				task->priv->user_data = user_data;
+				
+				relative_path = g_file_get_relative_path(root,file);
+				strcpy(task->priv->filename,relative_path);
+				g_free(relative_path);
+				
+				CHANNEL_DEBUG(channel, "Insert a xfer task:%d to task list",
+				              task->priv->id);
+				g_hash_table_insert(c->file_xfer_tasks,
+				                    GUINT_TO_POINTER(task->priv->id),
+				                    task);
+				                    
+				g_signal_connect(task, "finished", G_CALLBACK(task_finished), channel);
+				g_signal_emit(channel, signals[SPICE_MAIN_NEW_FILE_TRANSFER], 0, task);
+                
+                g_file_read_async(file,
+                        G_PRIORITY_DEFAULT,
+                        cancellable,
+                        file_xfer_directory_read_async_cb,
+                        g_object_ref(task));
+                        
+                
+                task->priv->pending = TRUE;
+                
+               	/* if we created a per-task cancellable above, free it */
+				if (!cancellable)
+				    g_object_unref(task_cancellable);
+				    
+                g_object_unref(file);	
+            }
+            
+            g_object_unref(root);
+            g_array_free (array_directorys, FALSE);
+        	g_array_free (array_files, FALSE);
+        }
     }
 }
 
@@ -3265,6 +3563,7 @@ spice_file_transfer_task_finalize(GObject *object)
     SpiceFileTransferTask *self = SPICE_FILE_TRANSFER_TASK(object);
 
     g_free(self->priv->buffer);
+    g_free(self->priv->filename);
 
     G_OBJECT_CLASS(spice_file_transfer_task_parent_class)->finalize(object);
 }
@@ -3398,6 +3697,7 @@ spice_file_transfer_task_init(SpiceFileTransferTask *self)
 {
     self->priv = FILE_TRANSFER_TASK_PRIVATE(self);
     self->priv->buffer = g_malloc0(FILE_XFER_CHUNK_SIZE);
+    self->priv->filename = g_malloc0(MAX_PATH);
 }
 
 static SpiceFileTransferTask *
@@ -3462,3 +3762,14 @@ char* spice_file_transfer_task_get_filename(SpiceFileTransferTask *self)
 {
     return g_file_get_basename(self->priv->file);
 }
+
+guint64 spice_file_transfer_task_get_total_bytes(SpiceFileTransferTask *self)
+{
+    return self->priv->file_size;
+}
+
+guint64 spice_file_transfer_task_get_transferred_bytes(SpiceFileTransferTask *self)
+{
+    return self->priv->read_bytes;
+}
+
