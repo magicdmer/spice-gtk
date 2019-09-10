@@ -368,7 +368,7 @@ static void decode_header(GlibGlzDecoder *d)
     d->image.id = decode_64(d);
     d->image.win_head_dist = decode_32(d);
 
-    SPICE_DEBUG("%s: %dx%d, id %" PRId64 ", ref %" PRId64,
+    SPICE_DEBUG("%s: %dx%d, id %lld , ref %lld",
             __FUNCTION__,
             d->image.width, d->image.height, d->image.id,
             d->image.id - d->image.win_head_dist);
